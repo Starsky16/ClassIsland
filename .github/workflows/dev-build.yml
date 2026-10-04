@@ -1,0 +1,165 @@
+name: Dev Build (预发布)
+
+# dev 分支的"发布级验证包"：把 release 打包挪到云端，减轻本地设备压力。
+# 触发方式：
+#   1. Actions 页手动触发（workflow_dispatch）
+#   2. 推送到 dev 且**最新一条 commit message 含 [build]** 时自动触发
+# 产物发布到固定 tag dev-build 的 pre-release，每次构建覆盖更新——
+# Releases 页始终只有一个预发布条目，不会刷成流水账。
+# 构建与打包方式与 build_release.yml 保持一致（windows-2022 出 app 与 launcher，
+# ubuntu 出 folder 包）；fork 未配置上游签名 secrets，发布未签名包。
+# 正式发版仍走 build_release.yml（打 tag / 手动传参），互不干扰。
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [dev]
+
+# 同一时刻只保留一条 dev 构建在跑，新提交顶掉旧构建
+concurrency:
+  group: dev-build
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+env:
+  PDC_CLIENT_VERSION: 1.0.0.1  # 与 build_release.yml 一致，pack 阶段安装 PDCC 用
+
+jobs:
+  build:
+    name: Build app & launcher (windows x64)
+    runs-on: windows-2022
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      # 非 [build] 提交不构建：手动触发不受此限制
+      - name: Skip unless latest commit message contains [build]
+        if: github.event_name == 'push'
+        env:
+          SUBJECT: ${{ github.event.head_commit.message }}
+        shell: bash
+        run: |
+          if ! printf '%s' "$SUBJECT" | grep -q '\[build\]'; then
+            echo "最新提交不含 [build] 标记，跳过 dev 构建"
+            exit 78 # neutral：标记为跳过而非失败
+          fi
+
+      # 与 build_release.yml 相同：app 用 8.0.x，launcher（native AOT）另需 9.0.x
+      - name: Install .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            9.0.x
+
+      - name: Add GitHub Package Registry
+        shell: pwsh
+        run: dotnet nuget add source --username ClassIsland --password ${{ secrets.GITHUB_TOKEN }} --store-password-in-clear-text --name github "https://nuget.pkg.github.com/ClassIsland/index.json"
+
+      # 上游发版取自触发 tag；dev 构建无 tag，改用 git describe 解析最近可达 tag
+      - name: Resolve app version from git tags
+        id: version
+        shell: bash
+        run: |
+          APP_VERSION=$(git describe --tags --abbrev=0 2>/dev/null || echo "0.0.0.0")
+          echo "app_version=$APP_VERSION" >> "$GITHUB_OUTPUT"
+          echo "AppVersion = $APP_VERSION"
+
+      # 与 build_release.yml build_app 一致：folder 包的 app 本体（依赖框架版）
+      - name: ☢️ NUKE PublishApp
+        env:
+          buildType: full
+          package: folder
+          arch: x64
+          osName: windows
+          buildName: appBase
+          appVersion: ${{ steps.version.outputs.app_version }}
+          # fork 未配置上游签名/语音密钥 secrets：留空则生成未填充的 secrets.g.cs，仅语音合成等功能降级
+          test_signing_key: ${{ secrets.TEST_SIGNING_KEY }}
+          ApiSigningKey: ${{ secrets.API_SIGNING_KEY }}
+          ApiSigningKeyPs: ${{ secrets.API_SIGNING_KEY_PS }}
+        shell: pwsh
+        run: pwsh -ep bypass ./build.ps1 PublishApp
+
+      - name: Upload appBase zip to artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: out_appBase_windows_x64_full_folder
+          path: ./out/out_appBase_windows_x64_full_folder.zip
+
+      # 与 build_release.yml build_launcher 一致：native AOT 单文件启动器
+      - name: ☢️ NUKE PublishLauncher
+        env:
+          buildType: aot
+          package: singleFile
+          arch: x64
+          osName: windows
+          buildName: launcher
+        shell: pwsh
+        run: pwsh -ep bypass ./build.ps1 PublishLauncher
+
+      - name: Upload launcher zip to artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: out_launcher_windows_x64_aot_singleFile
+          path: ./out/out_launcher_windows_x64_aot_singleFile.zip
+
+  # folder 包与 files.json 必须在 linux 上生成（folder.ps1 安装的是 linux 版 PDCC）
+  pack_release:
+    name: Pack folder & publish dev-build prerelease
+    runs-on: ubuntu-latest
+    needs: [ build ]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # pack 脚本内部用 git describe --tags 取版本目录名
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./out_artifacts
+
+      - name: Combine artifacts
+        shell: pwsh
+        run: pwsh -ep bypass ./tools/release-gen/combine-artifacts.ps1
+
+      - name: Generate folder package
+        env:
+          package: folder
+          arch: x64
+          osName: windows
+          buildType: full
+          artifact_name: out_app_windows_x64_full_folder
+        shell: pwsh
+        run: pwsh -ep bypass ./tools/release-gen/pack/entry.ps1
+
+      - name: Publish prerelease dev-build
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # 固定 tag dev-build：先删旧 Release（连 tag），再在当前提交上重建
+          gh release delete dev-build --yes --cleanup-tag || true
+          APP_VERSION=$(git describe --tags --abbrev=0 2>/dev/null || echo "0.0.0.0")
+          {
+            echo "自动构建于 GitHub Actions（dev 分支预发布，随时可能被覆盖更新）。"
+            echo "folder 包：解压后含启动器 ClassIsland.exe 与 app-${APP_VERSION}-0/ 应用本体，"
+            echo "与正式发布的 folder 包同构，可整体替换现有宿主目录使用。"
+            echo ""
+            echo "- 提交：${GITHUB_SHA::7} $(git log -1 --format=%s)"
+            echo "- 构建时间：$(date -u '+%Y-%m-%d %H:%M UTC')"
+            echo "- 版本号来源：git describe --tags --abbrev=0 → ${APP_VERSION}"
+            echo "- ⚠️ 本包**未签名**：fork 未配置上游 SignPath 代码签名（SIGNPATH_TOKEN）与语音合成密钥（API_SIGNING_KEY*），对应功能降级。"
+            echo "- 稳定版请用 [正式 Release](https://github.com/${GITHUB_REPOSITORY}/releases/latest)"
+          } > "$RUNNER_TEMP/notes.md"
+          gh release create dev-build \
+            --target "$GITHUB_SHA" \
+            --prerelease \
+            --title "dev 预构建 · ${GITHUB_SHA::7}" \
+            --notes-file "$RUNNER_TEMP/notes.md" \
+            out_pack/out_app_windows_x64_full_folder.zip
