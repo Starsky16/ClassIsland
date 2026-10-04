@@ -49,9 +49,9 @@ jobs:
             8.0.x
             9.0.x
 
-      - name: Add GitHub Package Registry
-        shell: pwsh
-        run: dotnet nuget add source --username ClassIsland --password ${{ secrets.GITHUB_TOKEN }} --store-password-in-clear-text --name github "https://nuget.pkg.github.com/ClassIsland/index.json"
+      # 上游 build_release.yml 会添加 GitHub Packages 源，但 fork 的 GITHUB_TOKEN 跨 org 读
+      # ClassIsland 的包是 403（实测），且 dev 依赖的 ClassIsland.Markdown.Avalonia* 在
+      # nuget.org 均有同版本镜像，故不添加该源，restore 全走 nuget.org。
 
       # 上游发版取自触发 tag；dev 构建无 tag，改用 git describe 解析最近可达 tag
       - name: Resolve app version from git tags
