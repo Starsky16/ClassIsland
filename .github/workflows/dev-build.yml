@@ -101,10 +101,10 @@ jobs:
           name: out_launcher_windows_x64_aot_singleFile
           path: ./out/out_launcher_windows_x64_aot_singleFile.zip
 
-  # folder 包与 files.json 必须在 linux 上生成（folder.ps1 安装的是 linux 版 PDCC）
+  # master 谱系 folder.ps1 按 osName 装 PDCC：windows 包须在 windows runner 上打（win 版 PDCC）
   pack_release:
     name: Pack folder & publish dev-build prerelease
-    runs-on: ubuntu-latest
+    runs-on: windows-2022
     needs: [ build ]
     steps:
       - name: Checkout
@@ -132,6 +132,7 @@ jobs:
         run: pwsh -ep bypass ./tools/release-gen/pack/entry.ps1
 
       - name: Publish prerelease dev-build
+        shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
