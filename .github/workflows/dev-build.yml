@@ -13,7 +13,7 @@ name: Dev Build (预发布)
 on:
   workflow_dispatch:
   push:
-    branches: [dev]
+    branches: [dev_starsky16]
 
 # 同一时刻只保留一条 dev 构建在跑，新提交顶掉旧构建
 concurrency:
